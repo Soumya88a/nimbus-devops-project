@@ -1,0 +1,163 @@
+#!/bin/bash
+set -euxo pipefail
+
+dnf update -y
+dnf install -y docker awscli2 curl jq openssl
+
+systemctl enable --now docker
+
+mkdir -p /opt/nimbus
+cat > /opt/nimbus/docker-compose.yml <<'COMPOSE'
+services:
+  api:
+    image: $${NIMBUS_IMAGE}
+    env_file:
+      - .env
+    ports:
+      - "8000:8000"
+    depends_on:
+      db:
+        condition: service_healthy
+      cache:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/ready', timeout=3)"]
+      interval: 15s
+      timeout: 5s
+      start_period: 25s
+      retries: 5
+    restart: unless-stopped
+
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: nimbus
+      POSTGRES_USER: nimbus
+      POSTGRES_PASSWORD: $${POSTGRES_PASSWORD}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U nimbus -d nimbus"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  cache:
+    image: redis:7-alpine
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  loki:
+    image: grafana/loki:3.5.2
+    command: -config.file=/etc/loki/config.yml
+    volumes:
+      - /opt/nimbus/loki-config.yml:/etc/loki/config.yml:ro
+      - loki-data:/loki
+    restart: unless-stopped
+
+  promtail:
+    image: grafana/promtail:3.5.2
+    command: -config.file=/etc/promtail/config.yml
+    volumes:
+      - /opt/nimbus/promtail-config.yml:/etc/promtail/config.yml:ro
+      - /var/lib/docker/containers:/var/lib/docker/containers:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    depends_on:
+      - loki
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:12.1.1
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: $${GRAFANA_ADMIN_PASSWORD}
+    ports:
+      - "3000:3000"
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - /opt/nimbus/grafana-datasources.yml:/etc/grafana/provisioning/datasources/datasources.yml:ro
+    depends_on:
+      - loki
+    restart: unless-stopped
+
+volumes:
+  postgres-data:
+  loki-data:
+  grafana-data:
+COMPOSE
+
+cat > /opt/nimbus/loki-config.yml <<'LOKI'
+auth_enabled: false
+server:
+  http_listen_port: 3100
+common:
+  path_prefix: /loki
+  storage:
+    filesystem:
+      chunks_directory: /loki/chunks
+      rules_directory: /loki/rules
+  replication_factor: 1
+  ring:
+    kvstore:
+      store: inmemory
+schema_config:
+  configs:
+    - from: 2024-01-01
+      store: tsdb
+      object_store: filesystem
+      schema: v13
+      index:
+        prefix: index_
+        period: 24h
+LOKI
+
+cat > /opt/nimbus/promtail-config.yml <<'PROMTAIL'
+server:
+  http_listen_port: 9080
+positions:
+  filename: /tmp/positions.yaml
+clients:
+  - url: http://loki:3100/loki/api/v1/push
+scrape_configs:
+  - job_name: docker
+    docker_sd_configs:
+      - host: unix:///var/run/docker.sock
+        refresh_interval: 5s
+    relabel_configs:
+      - source_labels: ["__meta_docker_container_name"]
+        target_label: "container"
+      - source_labels: ["__meta_docker_container_log_stream"]
+        target_label: "stream"
+PROMTAIL
+
+cat > /opt/nimbus/grafana-datasources.yml <<'GRAFANA'
+apiVersion: 1
+datasources:
+  - name: Loki
+    type: loki
+    access: proxy
+    url: http://loki:3100
+    isDefault: true
+GRAFANA
+
+if [ ! -f /opt/nimbus/.env ]; then
+  DB_PASSWORD="$(openssl rand -base64 32 | tr -dc 'A-Za-z0-9' | head -c 24)"
+  GRAFANA_PASSWORD="$(openssl rand -base64 32 | tr -dc 'A-Za-z0-9' | head -c 24)"
+  cat > /opt/nimbus/.env <<EOF
+APP_ENV=staging
+POSTGRES_PASSWORD=$DB_PASSWORD
+GRAFANA_ADMIN_PASSWORD=$GRAFANA_PASSWORD
+DATABASE_URL=postgresql://nimbus:$DB_PASSWORD@db:5432/nimbus
+REDIS_URL=redis://cache:6379/0
+LOG_LEVEL=INFO
+NIMBUS_IMAGE=${ecr_repository_url}:bootstrap
+EOF
+  chmod 600 /opt/nimbus/.env
+fi
+
+echo "Nimbus bootstrap complete" > /var/log/nimbus-bootstrap.log
