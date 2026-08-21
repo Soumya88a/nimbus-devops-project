@@ -10,13 +10,13 @@ pipeline {
 
         stage('Build') {
             steps {
-                bat 'echo "Building application..."'
+                sh 'echo "Building application..."'
             }
         }
 
         stage('Deploy to EKS') {
             steps {
-                bat '''
+                sh '''
                 aws eks --region us-west-1 update-kubeconfig --name jenkins-proj
                 kubectl apply -f deployment.yaml
                 kubectl apply -f service.yaml
