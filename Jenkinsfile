@@ -16,7 +16,7 @@ pipeline {
 
         stage('Deploy to EKS') {
             steps {
-                sh '''
+                bat '''
                 aws eks --region us-west-1 update-kubeconfig --name jenkins-proj
                 kubectl apply -f deployment.yaml
                 kubectl apply -f service.yaml
